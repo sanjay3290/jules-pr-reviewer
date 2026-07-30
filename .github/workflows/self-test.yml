@@ -11,6 +11,8 @@ jobs:
       contents: read
       statuses: write
     steps:
+      # `uses: ./` resolves the action from the workspace, so the repo must be on disk first.
+      - uses: actions/checkout@v4
       - uses: ./
         with:
           jules_api_key: ${{ secrets.JULES_API_KEY }}
