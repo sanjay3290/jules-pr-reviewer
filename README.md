@@ -186,7 +186,7 @@ Then run: `JULES_API_KEY=... node list-sources.mjs`
 ## Security
 
 - **Only `pull_request` is supported.** `pull_request_target` is rejected — it runs with base-repo write tokens, and exposes the action to prompt-injection via attacker-controlled diffs.
-- **Fork PRs are skipped by default** (`skip_forks: true`). An untrusted fork's diff/PR description can contain prompt-injection payloads. The action's system prompt has defense-in-depth instructions telling Jules to ignore instructions embedded in untrusted content and flag them as blocking — but skipping forks is the safer default.
+- **Fork PRs are skipped by default** (`skip_forks: true`). An untrusted fork's diff/PR description can contain prompt-injection payloads. The action's system prompt has defense-in-depth instructions telling Jules to ignore instructions embedded in untrusted content and report them as a `[WARN]` finding — but skipping forks is the safer default. The primary defense is that the verdict reflects Jules' own reading of the code; the finding is a tripwire report, and on its own never blocks. Ordinary imperative prose in a PR description (test plans, reviewer checklists) is explicitly not treated as an injection attempt.
 - **`rules_file` is loaded from the base SHA**, not the PR head. An attacker cannot change the review rules by editing them in their PR.
 - **All untrusted content is fenced** in the prompt as "UNTRUSTED" with explicit instructions to Jules.
 - **Failure modes are resilient**: if Jules times out, the API errors, or the action crashes, the commit status is set to `error` and the PR comment is updated with a failure note — merge isn't silently blocked by a stale `pending` check.
@@ -196,7 +196,10 @@ Then run: `JULES_API_KEY=... node list-sources.mjs`
 - **Latency**: typical review is 40s–5min.
 - **Cost**: each PR open/push creates one Jules session. Rate-limit via `bypass_label`, label-gated workflow triggers, or `paths:` filters.
 - **Drafts**: skipped by default; mark `ready_for_review` to trigger.
-- **Large diffs**: diff is truncated at 80 KB. When truncated, the prompt tells Jules its review may be incomplete.
+- **Large diffs**: the diff is fitted into an 80 KB budget. Generated files (lockfiles, `dist/`, `build/`, `vendor/`, minified assets, snapshots) are excluded first, then any single remaining file is capped so one large change can't crowd out the rest of the PR. Whatever was excluded, truncated, or omitted is named in the prompt so Jules can caveat its review.
+- **One comment per PR**: the action reuses its existing comment (matched by a hidden marker) instead of adding a new one on every push, so a PR doesn't accumulate stale verdicts.
+- **Repository facts**: the action reads the repo's visibility and fork policy and passes them to Jules as trusted context. This suppresses findings whose preconditions don't hold — e.g. fork-PR attack scenarios on a repo where forking is disabled.
+- **Checkout point**: Jules' workspace is cloned at the PR head (base for fork PRs), so it can open the changed files to verify a finding rather than reasoning from the diff text alone.
 
 ## License
 
