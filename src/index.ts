@@ -8,6 +8,7 @@ type Verdict = 'approve' | 'comment' | 'block';
 
 const COMMENT_MARKER = '<!-- jules-pr-reviewer -->';
 const VALID_FAIL_ON: FailOn[] = ['never', 'blocking', 'any'];
+const VERDICT_RE = /VERDICT:\s*(approve|comment|block)/i;
 
 async function run(): Promise<void> {
   const apiKey = core.getInput('jules_api_key', { required: true });
@@ -80,16 +81,9 @@ async function run(): Promise<void> {
     const inProgressBody =
       `${COMMENT_MARKER}\n🤖 **Jules is reviewing this PR.** Results will appear here shortly (typically 2–5 minutes).`;
 
-    let createdId: number;
-    try {
-      const created = await octokit.rest.issues.createComment({
-        owner, repo, issue_number: prNumber, body: inProgressBody,
-      });
-      createdId = created.data.id;
-    } catch (err) {
-      throw wrapPermissionError(err, 'pull-requests:write', 'createComment');
-    }
-    commentId = createdId;
+    commentId = await upsertReviewComment(octokit, owner, repo, prNumber, inProgressBody);
+
+    const repoFacts = await fetchRepoFacts(octokit, owner, repo);
 
     const diff = await fetchDiff(octokit, owner, repo, pr);
 
@@ -98,7 +92,7 @@ async function run(): Promise<void> {
       rulesFromFile = await loadRulesFromBase(octokit, owner, repo, rulesFilePath, baseSha);
     }
 
-    const { text: diffText, truncatedNote } = truncateDiff(diff, 80_000);
+    const { text: diffText, truncatedNote } = prepareDiff(diff, 80_000);
 
     const prompt = buildReviewPrompt({
       repoFullName: `${owner}/${repo}`,
@@ -111,14 +105,20 @@ async function run(): Promise<void> {
       diffTruncatedNote: truncatedNote,
       extraInstructions: extraInstructions || undefined,
       rulesFromFile,
+      repoFacts: { ...repoFacts, headCheckedOut: !isFork, headBranch: pr.head.ref },
     });
 
     const customJules = jules.with({ apiKey });
 
+    // Jules clones the repo into its own workspace. Point it at the PR head so the agent can open
+    // the changed files to verify a finding before reporting it — at base it can only see the diff
+    // text. A fork's head ref does not exist in this repository, so fall back to base there.
+    const sourceBranch = isFork ? pr.base.ref : pr.head.ref;
+
     core.info('Creating Jules review session…');
     const session = await customJules.session({
       prompt,
-      source: { github: `${owner}/${repo}`, baseBranch: pr.base.ref },
+      source: { github: `${owner}/${repo}`, baseBranch: sourceBranch },
       requireApproval: false,
       autoPr: false,
     });
@@ -192,6 +192,70 @@ async function fetchDiff(
   return data;
 }
 
+/**
+ * Verified repository configuration passed to the reviewer as trusted context. Without it the model
+ * only sees a diff, so it raises generically-true findings whose preconditions do not hold here —
+ * e.g. fork-PR attack scenarios on a repository where forking is disabled.
+ */
+async function fetchRepoFacts(
+  octokit: ReturnType<typeof github.getOctokit>,
+  owner: string, repo: string,
+): Promise<{ visibility?: string; allowForking?: boolean }> {
+  try {
+    const { data } = await octokit.rest.repos.get({ owner, repo });
+    return {
+      visibility: data.visibility ?? (data.private ? 'private' : 'public'),
+      allowForking: data.allow_forking,
+    };
+  } catch (err) {
+    core.warning(`Could not read repository settings: ${String(err)}. Continuing without them.`);
+    return {};
+  }
+}
+
+/**
+ * Reuse this action's existing comment on the PR instead of adding a new one per run — otherwise
+ * every push leaves another review comment and stale verdicts accumulate on the PR.
+ */
+async function upsertReviewComment(
+  octokit: ReturnType<typeof github.getOctokit>,
+  owner: string, repo: string, prNumber: number, body: string,
+): Promise<number> {
+  let existingId: number | undefined;
+  try {
+    for await (const { data } of octokit.paginate.iterator(octokit.rest.issues.listComments, {
+      owner, repo, issue_number: prNumber, per_page: 100,
+    })) {
+      for (const comment of data) {
+        if (typeof comment.body === 'string' && comment.body.includes(COMMENT_MARKER)) {
+          existingId = comment.id;
+        }
+      }
+    }
+  } catch (err) {
+    core.warning(`Could not list existing comments: ${String(err)}. Posting a new one.`);
+  }
+
+  if (existingId !== undefined) {
+    try {
+      await octokit.rest.issues.updateComment({ owner, repo, comment_id: existingId, body });
+      core.info(`Reusing existing review comment ${existingId}.`);
+      return existingId;
+    } catch (err) {
+      core.warning(`Could not update comment ${existingId}: ${String(err)}. Posting a new one.`);
+    }
+  }
+
+  try {
+    const created = await octokit.rest.issues.createComment({
+      owner, repo, issue_number: prNumber, body,
+    });
+    return created.data.id;
+  } catch (err) {
+    throw wrapPermissionError(err, 'pull-requests:write', 'createComment');
+  }
+}
+
 async function loadRulesFromBase(
   octokit: ReturnType<typeof github.getOctokit>,
   owner: string, repo: string, path: string, baseSha: string,
@@ -257,6 +321,7 @@ async function pollForReview(
 ): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   let attempt = 0;
+  let lastSeen = '';
   while (Date.now() < deadline) {
     attempt++;
     try {
@@ -266,10 +331,20 @@ async function pollForReview(
         if (a.type === 'agentMessaged') last = a.message;
       }
       if (last) {
-        core.info(`Got agentMessaged on attempt ${attempt}.`);
-        return last;
+        // Jules emits progress messages ("working on it…") before the review itself. Returning the
+        // first one would post it as the review and, with no VERDICT line, silently fall back to a
+        // passing verdict. Keep polling until a message carries the verdict line.
+        if (VERDICT_RE.test(last)) {
+          core.info(`Got final review with VERDICT line on attempt ${attempt}.`);
+          return last;
+        }
+        if (last !== lastSeen) {
+          core.info(`Interim message on attempt ${attempt} (no VERDICT line yet) — still polling.`);
+        }
+        lastSeen = last;
+      } else {
+        core.info(`No agentMessaged yet (attempt ${attempt})…`);
       }
-      core.info(`No agentMessaged yet (attempt ${attempt})…`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isAuthError(msg)) {
@@ -279,7 +354,13 @@ async function pollForReview(
     }
     await new Promise(r => setTimeout(r, 20_000));
   }
-  return '';
+  if (lastSeen) {
+    core.warning(
+      'Timed out waiting for a message containing a VERDICT line; posting the last message received. ' +
+      'The review may be incomplete.',
+    );
+  }
+  return lastSeen;
 }
 
 async function waitUntilSessionReady(session: { id: string; info: () => Promise<unknown> }): Promise<void> {
@@ -306,13 +387,95 @@ async function waitUntilSessionReady(session: { id: string; info: () => Promise<
   throw new Error('Session did not become ready within timeout.');
 }
 
-function truncateDiff(diff: string, maxChars: number): { text: string; truncatedNote?: string } {
-  if (diff.length <= maxChars) return { text: diff };
-  const text = diff.slice(0, maxChars);
-  return {
-    text,
-    truncatedNote: `The diff was truncated: original ${diff.length} chars, kept first ${maxChars}. Some changes are not visible in the diff above; your review of the visible portion should state this caveat.`,
-  };
+// Lockfiles, build output and other generated artifacts are never worth review attention, but they
+// are often the largest hunks in a diff. Dropping them first means the character budget is spent on
+// code a human would actually review.
+const GENERATED_FILE_PATTERNS: RegExp[] = [
+  /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb)$/,
+  /(^|\/)(composer\.lock|Gemfile\.lock|poetry\.lock|Pipfile\.lock|Cargo\.lock|go\.sum)$/,
+  /(^|\/)(dist|build|out|vendor|node_modules|coverage|__snapshots__)\//,
+  /\.(min\.js|min\.css|map|snap)$/,
+];
+
+function isGeneratedPath(path: string): boolean {
+  return GENERATED_FILE_PATTERNS.some(re => re.test(path));
+}
+
+/** Split a unified diff into per-file chunks, each starting at its `diff --git` header. */
+function splitDiffByFile(diff: string): { path: string; text: string }[] {
+  const files: { path: string; text: string }[] = [];
+  const lines = diff.split('\n');
+  let current: { path: string; text: string[] } | undefined;
+
+  for (const line of lines) {
+    const header = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    if (header) {
+      if (current) files.push({ path: current.path, text: current.text.join('\n') });
+      current = { path: header[2], text: [line] };
+    } else if (current) {
+      current.text.push(line);
+    }
+  }
+  if (current) files.push({ path: current.path, text: current.text.join('\n') });
+  return files;
+}
+
+/**
+ * Drop generated files, then fit what remains into `maxChars`, capping any single file so one large
+ * change cannot crowd out every other file in the PR.
+ */
+function prepareDiff(diff: string, maxChars: number): { text: string; truncatedNote?: string } {
+  const files = splitDiffByFile(diff);
+  // No recognisable file headers (empty or unexpected format) — fall back to a plain head cut.
+  if (files.length === 0) {
+    if (diff.length <= maxChars) return { text: diff };
+    return {
+      text: diff.slice(0, maxChars),
+      truncatedNote: `The diff was truncated: original ${diff.length} chars, kept first ${maxChars}. Some changes are not visible; say so in your review.`,
+    };
+  }
+
+  const skipped = files.filter(f => isGeneratedPath(f.path));
+  const kept = files.filter(f => !isGeneratedPath(f.path));
+  const notes: string[] = [];
+
+  if (skipped.length > 0) {
+    notes.push(
+      `${skipped.length} generated file(s) were excluded as not review-relevant: ` +
+      `${skipped.slice(0, 10).map(f => f.path).join(', ')}${skipped.length > 10 ? ', …' : ''}.`,
+    );
+  }
+  if (kept.length === 0) {
+    return { text: '(No review-relevant files changed — the diff contains only generated files.)', truncatedNote: notes.join(' ') };
+  }
+
+  const perFileCap = Math.max(2_000, Math.floor(maxChars / kept.length));
+  const parts: string[] = [];
+  const truncatedFiles: string[] = [];
+  const omittedFiles: string[] = [];
+  let used = 0;
+
+  for (const file of kept) {
+    if (used >= maxChars) { omittedFiles.push(file.path); continue; }
+    const budget = Math.min(perFileCap, maxChars - used);
+    if (file.text.length <= budget) {
+      parts.push(file.text);
+      used += file.text.length;
+    } else {
+      parts.push(`${file.text.slice(0, budget)}\n… [diff for ${file.path} truncated]`);
+      used += budget;
+      truncatedFiles.push(file.path);
+    }
+  }
+
+  if (truncatedFiles.length > 0) {
+    notes.push(`Truncated (too large to include in full): ${truncatedFiles.join(', ')}.`);
+  }
+  if (omittedFiles.length > 0) {
+    notes.push(`Omitted entirely for space: ${omittedFiles.join(', ')}.`);
+  }
+
+  return { text: parts.join('\n'), truncatedNote: notes.length > 0 ? notes.join(' ') : undefined };
 }
 
 function truncate(s: string, max: number): string {
@@ -320,7 +483,7 @@ function truncate(s: string, max: number): string {
 }
 
 function parseVerdict(message: string): Verdict {
-  const match = message.match(/VERDICT:\s*(approve|comment|block)/i);
+  const match = message.match(VERDICT_RE);
   if (match) return match[1].toLowerCase() as Verdict;
   if (/\[BLOCKING\]/.test(message)) return 'block';
   return 'comment';
