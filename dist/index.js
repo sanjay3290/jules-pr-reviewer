@@ -40924,6 +40924,17 @@ async function fetchRepoFacts(octokit, owner, repo) {
         return {};
     }
 }
+/** Id of this action's own comment on the PR, if it has one. Stops at the first match. */
+async function findReviewCommentId(octokit, owner, repo, prNumber) {
+    for await (const { data } of octokit.paginate.iterator(octokit.rest.issues.listComments, {
+        owner, repo, issue_number: prNumber, per_page: 100,
+    })) {
+        const match = data.find(c => typeof c.body === 'string' && c.body.includes(COMMENT_MARKER));
+        if (match)
+            return match.id;
+    }
+    return undefined;
+}
 /**
  * Reuse this action's existing comment on the PR instead of adding a new one per run — otherwise
  * every push leaves another review comment and stale verdicts accumulate on the PR.
@@ -40931,15 +40942,7 @@ async function fetchRepoFacts(octokit, owner, repo) {
 async function upsertReviewComment(octokit, owner, repo, prNumber, body) {
     let existingId;
     try {
-        for await (const { data } of octokit.paginate.iterator(octokit.rest.issues.listComments, {
-            owner, repo, issue_number: prNumber, per_page: 100,
-        })) {
-            for (const comment of data) {
-                if (typeof comment.body === 'string' && comment.body.includes(COMMENT_MARKER)) {
-                    existingId = comment.id;
-                }
-            }
-        }
+        existingId = await findReviewCommentId(octokit, owner, repo, prNumber);
     }
     catch (err) {
         warning(`Could not list existing comments: ${String(err)}. Posting a new one.`);
