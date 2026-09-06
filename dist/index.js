@@ -40754,6 +40754,8 @@ End with EXACTLY one line, nothing after it:
 const COMMENT_MARKER = '<!-- jules-pr-reviewer -->';
 const VALID_FAIL_ON = ['never', 'blocking', 'any'];
 const VERDICT_RE = /VERDICT:\s*(approve|comment|block)/i;
+// Keeps very long PR titles from producing an unwieldy session title.
+const MAX_SESSION_TITLE_LENGTH = 120;
 async function run() {
     const apiKey = getInput('jules_api_key', { required: true });
     core_setSecret(apiKey);
@@ -40772,6 +40774,7 @@ async function run() {
     const rulesFilePath = getInput('rules_file');
     const timeoutMinutesRaw = getInput('timeout_minutes') || '30';
     const timeoutMinutes = Math.max(1, parseInt(timeoutMinutesRaw, 10) || 30);
+    const sessionTitleInput = getInput('session_title');
     const ctx = github_context;
     if (ctx.eventName === 'pull_request_target') {
         setFailed('pull_request_target is not supported — it runs with base-repo write tokens and exposes the action to prompt-injection via attacker-controlled diffs. Use on: pull_request instead.');
@@ -40845,9 +40848,15 @@ async function run() {
         // the changed files to verify a finding before reporting it — at base it can only see the diff
         // text. A fork's head ref does not exist in this repository, so fall back to base there.
         const sourceBranch = isFork ? pr.base.ref : pr.head.ref;
-        info('Creating Jules review session…');
+        // Shown in the Jules UI session list; without it sessions are untitled and
+        // indistinguishable from each other.
+        const sessionTitle = sessionTitleInput.trim()
+            ? truncate(sessionTitleInput.trim(), MAX_SESSION_TITLE_LENGTH)
+            : defaultSessionTitle(owner, repo, prNumber, pr.title || '');
+        info(`Creating Jules review session "${sessionTitle}"…`);
         const session = await customJules.session({
             prompt,
+            title: sessionTitle,
             source: { github: `${owner}/${repo}`, baseBranch: sourceBranch },
             requireApproval: false,
             autoPr: false,
@@ -41167,6 +41176,18 @@ function prepareDiff(diff, maxChars) {
 }
 function truncate(s, max) {
     return s.length <= max ? s : s.slice(0, max - 1) + '…';
+}
+// "<owner>/<repo>#<n>: <title>", fitted into MAX_SESSION_TITLE_LENGTH. Only
+// the PR title is ever truncated: "#<n>" is what distinguishes one session
+// from the next in the same repository, so it must survive even when the
+// owner/repo prefix is long enough to leave no room for the title at all.
+function defaultSessionTitle(owner, repo, prNumber, title) {
+    const prefix = `${owner}/${repo}#${prNumber}`;
+    const separator = ': ';
+    const room = MAX_SESSION_TITLE_LENGTH - prefix.length - separator.length;
+    if (!title || room < 1)
+        return prefix;
+    return prefix + separator + truncate(title, room);
 }
 function parseVerdict(message) {
     const match = message.match(VERDICT_RE);
