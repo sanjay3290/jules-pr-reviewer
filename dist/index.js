@@ -40850,7 +40850,9 @@ async function run() {
         const sourceBranch = isFork ? pr.base.ref : pr.head.ref;
         // Shown in the Jules UI session list; without it sessions are untitled and
         // indistinguishable from each other.
-        const sessionTitle = truncate(sessionTitleInput.trim() || `${owner}/${repo}#${prNumber}: ${pr.title || ''}`, MAX_SESSION_TITLE_LENGTH);
+        const sessionTitle = sessionTitleInput.trim()
+            ? truncate(sessionTitleInput.trim(), MAX_SESSION_TITLE_LENGTH)
+            : defaultSessionTitle(owner, repo, prNumber, pr.title || '');
         info(`Creating Jules review session "${sessionTitle}"…`);
         const session = await customJules.session({
             prompt,
@@ -41174,6 +41176,18 @@ function prepareDiff(diff, maxChars) {
 }
 function truncate(s, max) {
     return s.length <= max ? s : s.slice(0, max - 1) + '…';
+}
+// "<owner>/<repo>#<n>: <title>", fitted into MAX_SESSION_TITLE_LENGTH. Only
+// the PR title is ever truncated: "#<n>" is what distinguishes one session
+// from the next in the same repository, so it must survive even when the
+// owner/repo prefix is long enough to leave no room for the title at all.
+function defaultSessionTitle(owner, repo, prNumber, title) {
+    const prefix = `${owner}/${repo}#${prNumber}`;
+    const separator = ': ';
+    const room = MAX_SESSION_TITLE_LENGTH - prefix.length - separator.length;
+    if (!title || room < 1)
+        return prefix;
+    return prefix + separator + truncate(title, room);
 }
 function parseVerdict(message) {
     const match = message.match(VERDICT_RE);

@@ -46,7 +46,7 @@ inputs:
     required: false
     default: '30'
   session_title:
-    description: 'Title shown for the session in the Jules UI, so reviews can be found and tracked there. Defaults to "<owner>/<repo>#<number>: <PR title>". Truncated to 120 characters.'
+    description: 'Title shown for the session in the Jules UI, so reviews can be found and tracked there. Defaults to "<owner>/<repo>#<number>: <PR title>", with the PR title truncated to fit 120 characters (the "<owner>/<repo>#<number>" part is always kept). A custom title is truncated to 120 characters.'
     required: false
     default: ''
 
