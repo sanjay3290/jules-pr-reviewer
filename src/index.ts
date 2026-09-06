@@ -9,6 +9,8 @@ type Verdict = 'approve' | 'comment' | 'block';
 const COMMENT_MARKER = '<!-- jules-pr-reviewer -->';
 const VALID_FAIL_ON: FailOn[] = ['never', 'blocking', 'any'];
 const VERDICT_RE = /VERDICT:\s*(approve|comment|block)/i;
+// Keeps very long PR titles from producing an unwieldy session title.
+const MAX_SESSION_TITLE_LENGTH = 120;
 
 async function run(): Promise<void> {
   const apiKey = core.getInput('jules_api_key', { required: true });
@@ -29,6 +31,7 @@ async function run(): Promise<void> {
   const rulesFilePath = core.getInput('rules_file');
   const timeoutMinutesRaw = core.getInput('timeout_minutes') || '30';
   const timeoutMinutes = Math.max(1, parseInt(timeoutMinutesRaw, 10) || 30);
+  const sessionTitleInput = core.getInput('session_title');
 
   const ctx = github.context;
   if (ctx.eventName === 'pull_request_target') {
@@ -115,9 +118,17 @@ async function run(): Promise<void> {
     // text. A fork's head ref does not exist in this repository, so fall back to base there.
     const sourceBranch = isFork ? pr.base.ref : pr.head.ref;
 
-    core.info('Creating Jules review session…');
+    // Shown in the Jules UI session list; without it sessions are untitled and
+    // indistinguishable from each other.
+    const sessionTitle = truncate(
+      sessionTitleInput.trim() || `${owner}/${repo}#${prNumber}: ${pr.title || ''}`,
+      MAX_SESSION_TITLE_LENGTH,
+    );
+
+    core.info(`Creating Jules review session "${sessionTitle}"…`);
     const session = await customJules.session({
       prompt,
+      title: sessionTitle,
       source: { github: `${owner}/${repo}`, baseBranch: sourceBranch },
       requireApproval: false,
       autoPr: false,

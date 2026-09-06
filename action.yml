@@ -45,6 +45,10 @@ inputs:
     description: 'How long to wait for Jules to return a review before giving up. Default 30. Real reviews on non-trivial PRs often take 15-25 minutes; do not set below 20 or you will miss legitimate reviews.'
     required: false
     default: '30'
+  session_title:
+    description: 'Title shown for the session in the Jules UI, so reviews can be found and tracked there. Defaults to "<owner>/<repo>#<number>: <PR title>". Truncated to 120 characters.'
+    required: false
+    default: ''
 
 runs:
   using: 'node20'

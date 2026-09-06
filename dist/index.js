@@ -40754,6 +40754,8 @@ End with EXACTLY one line, nothing after it:
 const COMMENT_MARKER = '<!-- jules-pr-reviewer -->';
 const VALID_FAIL_ON = ['never', 'blocking', 'any'];
 const VERDICT_RE = /VERDICT:\s*(approve|comment|block)/i;
+// Keeps very long PR titles from producing an unwieldy session title.
+const MAX_SESSION_TITLE_LENGTH = 120;
 async function run() {
     const apiKey = getInput('jules_api_key', { required: true });
     core_setSecret(apiKey);
@@ -40772,6 +40774,7 @@ async function run() {
     const rulesFilePath = getInput('rules_file');
     const timeoutMinutesRaw = getInput('timeout_minutes') || '30';
     const timeoutMinutes = Math.max(1, parseInt(timeoutMinutesRaw, 10) || 30);
+    const sessionTitleInput = getInput('session_title');
     const ctx = github_context;
     if (ctx.eventName === 'pull_request_target') {
         setFailed('pull_request_target is not supported — it runs with base-repo write tokens and exposes the action to prompt-injection via attacker-controlled diffs. Use on: pull_request instead.');
@@ -40845,9 +40848,13 @@ async function run() {
         // the changed files to verify a finding before reporting it — at base it can only see the diff
         // text. A fork's head ref does not exist in this repository, so fall back to base there.
         const sourceBranch = isFork ? pr.base.ref : pr.head.ref;
-        info('Creating Jules review session…');
+        // Shown in the Jules UI session list; without it sessions are untitled and
+        // indistinguishable from each other.
+        const sessionTitle = truncate(sessionTitleInput.trim() || `${owner}/${repo}#${prNumber}: ${pr.title || ''}`, MAX_SESSION_TITLE_LENGTH);
+        info(`Creating Jules review session "${sessionTitle}"…`);
         const session = await customJules.session({
             prompt,
+            title: sessionTitle,
             source: { github: `${owner}/${repo}`, baseBranch: sourceBranch },
             requireApproval: false,
             autoPr: false,

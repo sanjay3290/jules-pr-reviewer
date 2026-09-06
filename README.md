@@ -141,6 +141,8 @@ The workflow's `extra_instructions` is appended after the rules file content. Us
 | `status_context` | `jules/review` | Commit status context name. |
 | `extra_instructions` | `''` | Markdown appended to the prompt. |
 | `rules_file` | `.github/jules-review-rules.md` | Path in repo to load as extra rules. Set empty to disable. |
+| `timeout_minutes` | `30` | How long to wait for the review before giving up. Don't go below 20. |
+| `session_title` | `<owner>/<repo>#<n>: <PR title>` | Title shown in the Jules UI session list. Truncated to 120 chars. |
 
 ## Severity & verdict
 
